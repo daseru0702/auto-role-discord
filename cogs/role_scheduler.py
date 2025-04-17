@@ -20,12 +20,12 @@ class RoleScheduler(commands.Cog):
         self.cache = {}
         self.cache_ttl = 3600  # 캐시 유효기간(초)
         # 동시성 제어 세마포어 설정
-        self.api_semaphore = asyncio.Semaphore(5)   # 최대 5개 API 동시 호출
-        self.role_semaphore = asyncio.Semaphore(3)  # 최대 3개 역할 변경 동시 호출
+        self.api_semaphore = asyncio.Semaphore(5)   # 최대 API 동시 호출 수 조정
+        self.role_semaphore = asyncio.Semaphore(2)  # 최대 역할 변경 동시 호출 수 조정
 
         # 청크 처리 설정
         self.chunk_size = 100       # 한 청크에 처리할 멤버 수
-        self.chunk_delay = 1.0      # 청크 사이 대기(초)
+        self.chunk_delay = 1.5      # 청크 사이 대기(초)
 
         # 스케줄러 생성 (즉시 시작하지 않고 on_ready에서 시작)
         self.scheduler = AsyncIOScheduler()
@@ -34,6 +34,7 @@ class RoleScheduler(commands.Cog):
             self.check_all_members,
             trigger=trigger,
             name="role_assignment_job"
+            max_instances=1
         )
 
         # on_ready 시 스케줄러 시작

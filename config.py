@@ -20,8 +20,8 @@ MIN_ITEM_LEVEL = 1720
 ROLE_EXCELLENT = "우수회원"
 
 SCHEDULE_CRON = {
-    "hour": 3,
-    "minute": 0,
-    "second": 0,
-    "timezone": pytz.timezone("Asia/Seoul")
+    'hour': '0,3,6,9,12,15,18,21',
+    'minute': 0,
+    'second': 0,
+    'timezone': pytz.timezone("Asia/Seoul")
 }
