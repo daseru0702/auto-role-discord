@@ -1,221 +1,185 @@
 import asyncio
-import json
-import time
-
-import aiohttp
 import discord
 from discord.ext import commands
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
-
+import aiohttp
+from datetime import datetime
 import config
+import logging
+
+log = logging.getLogger("bot")
 
 class RoleScheduler(commands.Cog):
-    def __init__(self, bot: commands.Bot):
+    def __init__(self, bot):
         self.bot = bot
-
-        # 단일 ClientSession 생성
-        self.session = aiohttp.ClientSession()
-        # 캐시 초기화: {character_name: (level: float, timestamp: float)}
-        self.cache = {}
-        self.cache_ttl = 3600  # 캐시 유효기간(초)
-        # 동시성 제어 세마포어 설정
-        self.api_semaphore = asyncio.Semaphore(5)   # 최대 API 동시 호출 수 조정
-        self.role_semaphore = asyncio.Semaphore(2)  # 최대 역할 변경 동시 호출 수 조정
-
-        # 청크 처리 설정
-        self.chunk_size = 100       # 한 청크에 처리할 멤버 수
-        self.chunk_delay = 1.5      # 청크 사이 대기(초)
-
-        # 스케줄러 생성 (즉시 시작하지 않고 on_ready에서 시작)
         self.scheduler = AsyncIOScheduler()
         trigger = CronTrigger(**config.SCHEDULE_CRON)
         self.scheduler.add_job(
             self.check_all_members,
             trigger=trigger,
-            name="role_assignment_job"
+            name="role_assignment_job",
             max_instances=1
         )
-
-        # on_ready 시 스케줄러 시작
         bot.add_listener(self._start_scheduler, "on_ready")
+        self.chunk_size = 100
+        self.chunk_delay = 1.5
+        self.role_semaphore = asyncio.Semaphore(3)
 
-    async def _start_scheduler(self):
+    async def _start_scheduler(self, *args, **kwargs):
         if not self.scheduler.running:
             self.scheduler.start()
-            self.bot.logger.info(f"Scheduler started: {config.SCHEDULE_CRON}")
+            log.info(f"[bot] Scheduler started: {config.SCHEDULE_CRON}")
 
-    async def fetch_item_level(self, character_name: str) -> float | None:
-        """
-        캐싱, 동시성 제어 및 재시도 로직이 적용된 API 호출
-        """
-        now = time.time()
-        # 캐시 확인
-        if character_name in self.cache:
-            lvl, ts = self.cache[character_name]
-            if now - ts < self.cache_ttl:
-                self.bot.logger.info(f"[CACHE] {character_name} → {lvl}")
-                return lvl
+    async def check_all_members(self, ctx=None):
+        if ctx:
+            guild = ctx.guild
+        else:
+            guild = self.bot.get_guild(config.GUILD_ID)
 
+        role = discord.utils.get(guild.roles, name=config.ROLE_EXCELLENT)
+        verify_role = discord.utils.get(guild.roles, name="거래소인증")
+
+        if not guild or not role or not verify_role:
+            log.error("[ROLE_CHECK] 서버, 우수회원 역할 또는 거래소인증 역할을 찾을 수 없습니다.")
+            return
+
+        added, removed, skipped = 0, 0, 0
+        failed_members = []
+
+        async with aiohttp.ClientSession() as session:
+            members = guild.members
+            chunks = [members[i:i+self.chunk_size] for i in range(0, len(members), self.chunk_size)]
+
+            for chunk_index, chunk in enumerate(chunks):
+                log.info(f"[ROLE_CHECK] 청크 {chunk_index+1}/{len(chunks)} 시작")
+                tasks = []
+
+                for member in chunk:
+                    tasks.append(self.evaluate_member(session, guild, role, verify_role, member, failed_members))
+
+                results = await asyncio.gather(*tasks)
+                for result in results:
+                    if result == "added":
+                        added += 1
+                    elif result == "removed":
+                        removed += 1
+                    elif result == "skipped":
+                        skipped += 1
+
+                await asyncio.sleep(self.chunk_delay)
+
+            # 2차 재시도 처리
+            if failed_members:
+                log.info(f"[ROLE_CHECK] 템렙 재시도 대상: {len(failed_members)}명")
+                retry_results = await asyncio.gather(*[
+                    self.evaluate_member(session, guild, role, verify_role, member, [], is_retry=True)
+                    for member in failed_members
+                ])
+                for result in retry_results:
+                    if result == "added":
+                        added += 1
+                    elif result == "removed":
+                        removed += 1
+                    elif result == "skipped":
+                        skipped += 1
+
+        log.info(f"[ROLE_CHECK] 완료: 부여됨 {added}, 회수됨 {removed}, 건너뜀 {skipped}")
+
+        if ctx:
+            await ctx.send(f"역할 동기화 완료\n부여: {added}명\n회수: {removed}명\n건너뜀: {skipped}명")
+
+    async def evaluate_member(self, session, guild, role, verify_role, member, failed_members, is_retry=False):
+        async with self.role_semaphore:
+            should_have_role = False
+            has_role = role in member.roles
+            has_verify_role = verify_role in member.roles
+
+            if not has_verify_role:
+                log.debug(f"[ROLE_CHECK] {member.display_name} - 거래소인증 역할 없음")
+                return "skipped"
+
+            joined_at = member.joined_at
+            if joined_at and joined_at < config.JOIN_THRESHOLD:
+                should_have_role = True
+                log.debug(f"[ROLE_CHECK] {member.display_name} - 가입일 조건 충족")
+            else:
+                item_level = await self.fetch_item_level(session, member.display_name)
+                if item_level is not None:
+                    if item_level >= config.MIN_ITEM_LEVEL:
+                        should_have_role = True
+                        log.debug(f"[ROLE_CHECK] {member.display_name} - 템렙 조건 충족 ({item_level})")
+                    else:
+                        log.debug(f"[ROLE_CHECK] {member.display_name} - 템렙 낮음 ({item_level})")
+                else:
+                    log.warning(f"[ROLE_CHECK] {member.display_name} - 템렙 정보 가져오기 실패")
+                    if not is_retry:
+                        failed_members.append(member)
+                    return "skipped"
+
+            try:
+                if should_have_role and not has_role:
+                    await member.add_roles(role, reason="우수회원 자격 부여")
+                    log.info(f"[ROLE_ASSIGN] {member.display_name} → 역할 부여")
+                    return "added"
+                elif not should_have_role and has_role:
+                    await member.remove_roles(role, reason="우수회원 조건 미충족")
+                    log.info(f"[ROLE_REMOVE] {member.display_name} → 역할 회수")
+                    return "removed"
+                else:
+                    return "skipped"
+            except discord.Forbidden:
+                log.error(f"[ROLE_ASSIGN] {member.display_name} 역할 부여 실패: 권한 부족")
+                return "skipped"
+
+    async def fetch_item_level(self, session, character_name):
         url = config.LOA_API_URL.format(name=character_name)
         headers = {
             "Authorization": f"Bearer {config.LOA_API_KEY}",
             "Accept": "application/json"
         }
-        max_retries = 3
-        backoff_base = 1
 
-        # 동시성 제어
-        async with self.api_semaphore:
-            for attempt in range(max_retries):
-                try:
-                    self.bot.logger.info(f"[API] 시도 {attempt+1} GET {url}")
-                    async with self.session.get(url, headers=headers, timeout=10) as resp:
-                        body = await resp.text()
-                        status = resp.status
-                        if status == 200:
-                            data = None
-                            try:
-                                data = json.loads(body)
-                            except json.JSONDecodeError:
-                                self.bot.logger.error(f"[API] {character_name} JSON 파싱 실패: {body}")
+        for attempt in range(3):
+            try:
+                log.info(f"[API] 시도 {attempt+1} GET {url}")
+                async with session.get(url, headers=headers) as resp:
+                    if resp.status == 200:
+                        try:
+                            data = await resp.json()
+                            if data and isinstance(data, dict):
+                                raw_level = data.get("ItemAvgLevel")
+                                return float(raw_level.replace(",", "")) if raw_level else None
+                            else:
+                                log.warning(f"[API] {character_name} 응답이 비어있거나 잘못된 구조입니다.")
                                 return None
-                            # 데이터 유효성 검사
-                            if not isinstance(data, dict):
-                                self.bot.logger.warning(f"[API] {character_name} 응답 데이터 없음 또는 형식 오류: {data}")
-                                return None
-                            lvl_str = data.get("ItemMaxLevel") or data.get("ItemAvgLevel")
-                            if not lvl_str:
-                                self.bot.logger.error(f"[API] {character_name} 레벨 필드 없음: {data}")
-                                return None
-                            try:
-                                lvl = float(lvl_str.replace(",", ""))
-                            except ValueError:
-                                self.bot.logger.error(f"[API] {character_name} 레벨 파싱 실패: {lvl_str}")
-                                return None
-                            # 캐시에 저장
-                            self.cache[character_name] = (lvl, now)
-                            return lvl
-                        elif status == 429:
-                            wait = backoff_base * (2 ** attempt)
-                            self.bot.logger.warning(f"[API] 레이트 리밋, {wait}s 후 재시도")
-                            await asyncio.sleep(wait)
-                            continue
-                        else:
-                            self.bot.logger.error(f"[API] {character_name} 에러 {status}: {body}")
+                        except Exception as parse_err:
+                            log.error(f"[API] JSON 파싱 오류: {parse_err}")
                             return None
-                except asyncio.TimeoutError:
-                    self.bot.logger.warning(f"[API] {character_name} 타임아웃 시도 {attempt+1}")
-                except Exception as e:
-                    self.bot.logger.error(f"[API] 예외: {e}")
-                # 백오프 후 재시도
-                await asyncio.sleep(backoff_base * (2 ** attempt))
+                    elif resp.status == 429:
+                        retry_after = int(resp.headers.get("Retry-After", "3"))
+                        log.warning(f"[API] {character_name} → 429 Rate Limit. {retry_after}초 후 재시도")
+                        await asyncio.sleep(retry_after)
+                    else:
+                        log.warning(f"[API] {character_name} → {resp.status}")
+            except Exception as e:
+                log.error(f"[API] 예외: {e}")
+                await asyncio.sleep(1 + attempt * 2)
         return None
 
-    async def _process_member(self, member: discord.Member, role: discord.Role) -> tuple[int, int]:
-        """
-        단일 멤버 처리: 역할 추가/회수 및 결과(added, removed)를 반환
-        """
-        added = removed = 0
-        character_name = member.display_name
-        joined_ok = bool(member.joined_at and member.joined_at < config.JOIN_THRESHOLD)
-        lvl = await self.fetch_item_level(character_name)
-        gear_ok = bool(lvl and lvl >= config.MIN_ITEM_LEVEL)
-        excellent_ok = joined_ok or gear_ok
-
-        # 역할 부여
-        if excellent_ok and role not in member.roles:
-            for attempt in range(3):
-                try:
-                    async with self.role_semaphore:
-                        await member.add_roles(role)
-                    added = 1
-                    self.bot.logger.info(f"'{config.ROLE_EXCELLENT}' 역할 부여: {member}")
-                    break
-                except discord.HTTPException as e:
-                    if e.status == 429:
-                        wait = backoff_base * (2 ** attempt)
-                        self.bot.logger.warning(f"Rate limit 부여, {wait}s 후 재시도")
-                        await asyncio.sleep(wait)
-                        continue
-                    self.bot.logger.error(f"역할 부여 실패: {member}, {e}")
-                    break
-
-        # 역할 회수
-        elif not excellent_ok and role in member.roles:
-            for attempt in range(3):
-                try:
-                    async with self.role_semaphore:
-                        await member.remove_roles(role)
-                    removed = 1
-                    self.bot.logger.info(f"'{config.ROLE_EXCELLENT}' 역할 회수: {member}")
-                    break
-                except discord.HTTPException as e:
-                    if e.status == 429:
-                        wait = backoff_base * (2 ** attempt)
-                        self.bot.logger.warning(f"Rate limit 회수, {wait}s 후 재시도")
-                        await asyncio.sleep(wait)
-                        continue
-                    self.bot.logger.error(f"역할 회수 실패: {member}, {e}")
-                    break
-
-        return added, removed
-
-    async def check_all_members(self):
-        """
-        자동 스케줄: 전체 서버 멤버를 청크 단위로 처리
-        """
-        for guild in self.bot.guilds:
-            role = discord.utils.get(guild.roles, name=config.ROLE_EXCELLENT)
-            if not role:
-                self.bot.logger.warning(f"역할 '{config.ROLE_EXCELLENT}'을 찾을 수 없습니다.")
-                continue
-
-            members = guild.members
-            total = len(members)
-            for start in range(0, total, self.chunk_size):
-                chunk = members[start:start + self.chunk_size]
-                results = await asyncio.gather(*(self._process_member(m, role) for m in chunk))
-                if start + self.chunk_size < total:
-                    await asyncio.sleep(self.chunk_delay)
-
     @commands.command(name="sync_roles")
-    @commands.has_guild_permissions(administrator=True)
-    async def sync_roles(self, ctx: commands.Context):
-        """
-        !sync_roles — 수동 동기화: 조건 만족 시 역할 부여, 아니면 회수
-        """
-        role = discord.utils.get(ctx.guild.roles, name=config.ROLE_EXCELLENT)
-        if not role:
-            return await ctx.send(f"❌ 역할 '{config.ROLE_EXCELLENT}'을 찾을 수 없습니다.")
-
-        members = ctx.guild.members
-        total = len(members)
-        added = removed = 0
-        async with ctx.typing():
-            for start in range(0, total, self.chunk_size):
-                chunk = members[start:start + self.chunk_size]
-                results = await asyncio.gather(*(self._process_member(m, role) for m in chunk))
-                for a, r in results:
-                    added += a
-                    removed += r
-                if start + self.chunk_size < total:
-                    await asyncio.sleep(self.chunk_delay)
-        await ctx.send(f"✅ 동기화 완료: 추가 {added}건, 회수 {removed}건")
+    async def sync_roles(self, ctx):
+        await self.check_all_members(ctx)
+        await ctx.send("역할 동기화가 완료되었습니다.")
 
     @commands.command(name="check_templvl")
-    @commands.has_guild_permissions(administrator=True)
-    async def check_templvl(self, ctx: commands.Context, *, character_name: str):
-        """
-        !check_templvl 캐릭터명 — 테스트용: 해당 캐릭터의 평균 아이템레벨을 반환
-        """
-        async with ctx.typing():
-            lvl = await self.fetch_item_level(character_name)
+    async def check_templvl(self, ctx, character_name: str):
+        async with aiohttp.ClientSession() as session:
+            item_level = await self.fetch_item_level(session, character_name)
+            if item_level:
+                await ctx.send(f"{character_name}님의 평균 아이템 레벨은 {item_level} 입니다.")
+            else:
+                await ctx.send(f"{character_name}님의 아이템 레벨을 가져올 수 없습니다.")
 
-        if lvl is not None:
-            await ctx.send(f"{character_name}님의 평균 아이템 레벨은 **{lvl}** 입니다.")
-        else:
-            await ctx.send(f"{character_name}님의 아이템 레벨을 가져오지 못했습니다.")
 
-async def setup(bot: commands.Bot):
+async def setup(bot):
     await bot.add_cog(RoleScheduler(bot))
