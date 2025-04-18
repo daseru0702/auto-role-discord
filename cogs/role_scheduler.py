@@ -220,9 +220,9 @@ class RoleScheduler(commands.Cog):
         }
         # 지수적 백오프 + 재시도 호출
         data = await fetch_with_retry(session, url, headers, max_attempts=5, base_delay=1.0)
-        if not data or not isinstance(data, list):
-            log.warning(f"[SIBLINGS] 응답 형식 오류 또는 실패: {data}")
-            return None
+        if not isinstance(data, list) or len(data) == 0:
+            log.warning(f"[SIBLINGS] 빈 응답 또는 검색 실패: {data} → 단일 조회로 대체")
+            return await self.fetch_item_level(session, character_name)
 
         max_level = None
         for entry in data:
