@@ -11,9 +11,9 @@ DISCORD_TOKEN  = os.getenv("DISCORD_TOKEN")
 LOA_API_KEY    = os.getenv("LOA_API_KEY")
 GUILD_ID       = int(os.getenv("GUILD_ID"))
 
-LOA_API_URL    = (
+LOA_SIBLINGS_URL = (
     "https://developer-lostark.game.onstove.com"
-    "/armories/characters/{name}/profiles"
+    "/characters/{name}/siblings"
 )
 
 JOIN_THRESHOLD = datetime(2024, 1, 1, tzinfo=timezone.utc)

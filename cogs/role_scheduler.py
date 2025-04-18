@@ -8,6 +8,41 @@ import aiohttp
 from datetime import datetime
 import config
 import logging
+import random
+
+async def fetch_with_retry(session, url, headers, max_attempts=5, base_delay=1.0):
+    """
+    429 또는 네트워크 예외 시 지수적 백오프 + 재시도로 GET 요청을 보냅니다.
+    """
+    for attempt in range(1, max_attempts + 1):
+        try:
+            log.info(f"[API] 시도 {attempt}/{max_attempts} GET {url}")
+            async with session.get(url, headers=headers) as resp:
+                # 성공
+                if resp.status == 200:
+                    return await resp.json()
+
+                # rate limit
+                if resp.status == 429:
+                    retry_after = resp.headers.get("Retry-After")
+                    delay = float(retry_after) if retry_after else base_delay * (2 ** (attempt - 1))
+                    delay += random.uniform(0, 0.5)
+                    log.warning(f"[API] 429 Rate Limit, {delay:.1f}s 후 재시도")
+                    await asyncio.sleep(delay)
+                    continue
+
+                # 그 외 에러는 재시도 없이 중단
+                log.warning(f"[API] 상태 코드 {resp.status}, 중단")
+                return None
+
+        except Exception as e:
+            # 네트워크 에러 등
+            delay = base_delay * (2 ** (attempt - 1)) + random.uniform(0, 0.5)
+            log.error(f"[API] 예외: {e}, {delay:.1f}s 후 재시도")
+            await asyncio.sleep(delay)
+
+    log.error(f"[API] 최대 재시도({max_attempts}) 실패")
+    return None
 
 log = logging.getLogger("bot")
 
@@ -126,7 +161,7 @@ class RoleScheduler(commands.Cog):
                 reason = "join"
             # 서버 가입일이 기준보다 늦다면 아이템레벨 검사
             else:
-                item_level = await self.fetch_item_level(session, member.display_name)
+                item_level = await self.fetch_max_siblings_item_level(session, member.display_name)
                 if item_level is not None:
                     if item_level >= config.MIN_ITEM_LEVEL:
                         should_have_role = True
@@ -164,35 +199,40 @@ class RoleScheduler(commands.Cog):
             "Authorization": f"Bearer {config.LOA_API_KEY}",
             "Accept": "application/json"
         }
+        # 지수적 백오프 + 재시도 호출
+        data = await fetch_with_retry(session, url, headers, max_attempts=5, base_delay=1.0)
+        if not data or not isinstance(data, dict):
+            return None
 
-        for attempt in range(3):
-            try:
-                log.info(f"[API] 시도 {attempt+1} GET {url}")
-                async with session.get(url, headers=headers) as resp:
-                    if resp.status == 200:
-                        try:
-                            data = await resp.json()
-                        except Exception as e:
-                            log.error(f"[API] JSON 파싱 실패: {e}")
-                            return None
-                        
-                        if not isinstance(data, dict):
-                            log.warning(f"[API] 응답이 JSON이 아님: {data}")
-                            return None
-                        
-                        raw_level = data.get("ItemAvgLevel")
-                        return float(raw_level.replace(",", "")) if raw_level else None
-                        
-                    elif resp.status == 429:
-                        retry_after = int(resp.headers.get("Retry-After", "3"))
-                        log.warning(f"[API] {character_name} → 429 Rate Limit. {retry_after}초 후 재시도")
-                        await asyncio.sleep(retry_after)
-                    else:
-                        log.warning(f"[API] {character_name} → {resp.status}")
-            except Exception as e:
-                log.error(f"[API] 예외: {e}")
-                await asyncio.sleep(1 + attempt * 2)
-        return None
+        raw = data.get("ItemAvgLevel")
+        try:
+            return float(raw.replace(",", "")) if raw else None
+        except Exception as e:
+            log.error(f"[API] 아이템레벨 파싱 오류: {e}")
+            return None
+
+
+    async def fetch_max_siblings_item_level(self, session, character_name: str) -> float | None:
+        url = config.LOA_SIBLINGS_URL.format(name=character_name)
+        headers = {
+            "Authorization": f"Bearer {config.LOA_API_KEY}",
+            "Accept": "application/json"
+        }
+        # 지수적 백오프 + 재시도 호출
+        data = await fetch_with_retry(session, url, headers, max_attempts=5, base_delay=1.0)
+        if not data or not isinstance(data, list):
+            log.warning(f"[SIBLINGS] 응답 형식 오류 또는 실패: {data}")
+            return None
+
+        max_level = None
+        for entry in data:
+            raw = entry.get("ItemMaxLevel") or entry.get("ItemAvgLevel")
+            if raw:
+                lvl = float(raw.replace(",", ""))
+                max_level = lvl if max_level is None else max(max_level, lvl)
+
+        return max_level
+
 
     @commands.command(name="sync_roles")
     async def sync_roles(self, ctx):
@@ -204,7 +244,7 @@ class RoleScheduler(commands.Cog):
         async with aiohttp.ClientSession() as session:
             item_level = await self.fetch_item_level(session, character_name)
             if item_level:
-                await ctx.send(f"{character_name}님의 평균 아이템 레벨은 {item_level} 입니다.")
+                await ctx.send(f"{character_name}님의 아이템 레벨은 {item_level} 입니다.")
             else:
                 await ctx.send(f"{character_name}님의 아이템 레벨을 가져올 수 없습니다.")
 
