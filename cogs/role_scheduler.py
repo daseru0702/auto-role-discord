@@ -10,6 +10,9 @@ import config
 import logging
 import random
 
+
+log = logging.getLogger("bot")
+
 async def fetch_with_retry(session, url, headers, max_attempts=5, base_delay=1.0):
     """
     429 또는 네트워크 예외 시 지수적 백오프 + 재시도로 GET 요청을 보냅니다.
@@ -43,8 +46,6 @@ async def fetch_with_retry(session, url, headers, max_attempts=5, base_delay=1.0
 
     log.error(f"[API] 최대 재시도({max_attempts}) 실패")
     return None
-
-log = logging.getLogger("bot")
 
 class RoleScheduler(commands.Cog):
     def __init__(self, bot):
