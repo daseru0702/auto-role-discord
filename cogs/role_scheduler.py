@@ -1,3 +1,4 @@
+# role_scheduler.py
 import asyncio
 import discord
 from discord.ext import commands
@@ -45,6 +46,8 @@ class RoleScheduler(commands.Cog):
             return
 
         added, removed, skipped = 0, 0, 0
+        added_reasons = {"join": [], "item": []}
+        removed_reasons = {"join": [], "item": []}
         failed_members = []
 
         async with aiohttp.ClientSession() as session:
@@ -52,11 +55,11 @@ class RoleScheduler(commands.Cog):
             chunks = [members[i:i+self.chunk_size] for i in range(0, len(members), self.chunk_size)]
 
             for chunk_index, chunk in enumerate(chunks):
-                log.info(f"[ROLE_CHECK] 청크 {chunk_index+1}/{len(chunks)} 시작")
+                log.info(f"[ROLE_CHECK] 체크 {chunk_index+1}/{len(chunks)} 시작")
                 tasks = []
 
                 for member in chunk:
-                    tasks.append(self.evaluate_member(session, guild, role, verify_role, member, failed_members))
+                    tasks.append(self.evaluate_member(session, guild, role, verify_role, member, failed_members, added_reasons, removed_reasons))
 
                 results = await asyncio.gather(*tasks)
                 for result in results:
@@ -71,9 +74,9 @@ class RoleScheduler(commands.Cog):
 
             # 2차 재시도 처리
             if failed_members:
-                log.info(f"[ROLE_CHECK] 템렙 재시도 대상: {len(failed_members)}명")
+                log.info(f"[ROLE_CHECK] 아이템레벨 재시도 대상: {len(failed_members)}명")
                 retry_results = await asyncio.gather(*[
-                    self.evaluate_member(session, guild, role, verify_role, member, [], is_retry=True)
+                    self.evaluate_member(session, guild, role, verify_role, member, [], added_reasons, removed_reasons, is_retry=True)
                     for member in failed_members
                 ])
                 for result in retry_results:
@@ -86,52 +89,75 @@ class RoleScheduler(commands.Cog):
 
         log.info(f"[ROLE_CHECK] 완료: 부여됨 {added}, 회수됨 {removed}, 건너뜀 {skipped}")
 
+        # 로그 파일에 사유 별 데이터 기록
+        log.info(f"[DETAIL] 이용자 부여 (join): {', '.join(added_reasons['join'])}")
+        log.info(f"[DETAIL] 이용자 부여 (item): {', '.join(added_reasons['item'])}")
+        log.info(f"[DETAIL] 이용자 회수 (join): {', '.join(removed_reasons['join'])}")
+        log.info(f"[DETAIL] 이용자 회수 (item): {', '.join(removed_reasons['item'])}")
+
         if ctx:
             await ctx.send(f"역할 동기화 완료\n부여: {added}명\n회수: {removed}명\n건너뜀: {skipped}명")
 
-    async def evaluate_member(self, session, guild, role, verify_role, member, failed_members, is_retry=False):
+    async def evaluate_member(self, session, guild, role, verify_role, member, failed_members, added_reasons, removed_reasons, is_retry=False):
         async with self.role_semaphore:
-            should_have_role = False
-            has_role = role in member.roles
-            has_verify_role = verify_role in member.roles
-
+            should_have_role = False                        # 조건 충족 여부
+            reason = None                                   # 처리 사유
+            has_role = role in member.roles                 # 우수회원 역할 보유 여부
+            has_verify_role = verify_role in member.roles   # 거래소인증 역할 보유 여부
+    
+            # 우수회원 역할이 있지만 거래소인증 역할이 없는 경우 : 역할 회수
             if not has_verify_role:
-                log.debug(f"[ROLE_CHECK] {member.display_name} - 거래소인증 역할 없음")
+                if has_role:
+                    try:
+                        await member.remove_roles(role, reason="거래소인증 없음")
+                        log.info(f"[ROLE_REMOVE] {member.display_name} ← 거래소인증 없음으로 회수")
+                        removed_reasons["join"].append(member.display_name)
+                        return "removed"
+                    except discord.Forbidden:
+                        log.error(f"[ROLE_REMOVE_FAIL] 권한 부족: {member.display_name}")
+                        return "skipped"
                 return "skipped"
-
+    
+            # 거래소인증 역할이 있음 : 조건 검사 시작
+            # 서버 가입일 검사
             joined_at = member.joined_at
             if joined_at and joined_at < config.JOIN_THRESHOLD:
                 should_have_role = True
-                log.debug(f"[ROLE_CHECK] {member.display_name} - 가입일 조건 충족")
+                reason = "join"
+            # 서버 가입일이 기준보다 늦다면 아이템레벨 검사
             else:
                 item_level = await self.fetch_item_level(session, member.display_name)
                 if item_level is not None:
                     if item_level >= config.MIN_ITEM_LEVEL:
                         should_have_role = True
-                        log.debug(f"[ROLE_CHECK] {member.display_name} - 템렙 조건 충족 ({item_level})")
+                        reason = "item"
                     else:
-                        log.debug(f"[ROLE_CHECK] {member.display_name} - 템렙 낮음 ({item_level})")
+                        reason = "item"
                 else:
-                    log.warning(f"[ROLE_CHECK] {member.display_name} - 템렙 정보 가져오기 실패")
                     if not is_retry:
                         failed_members.append(member)
                     return "skipped"
-
+            
+            # 역할 부여
             try:
+                # 자격이 있는, 우수회원 역할 미보유자 : 역할 부여
                 if should_have_role and not has_role:
                     await member.add_roles(role, reason="우수회원 자격 부여")
-                    log.info(f"[ROLE_ASSIGN] {member.display_name} → 역할 부여")
+                    if reason:
+                        added_reasons[reason].append(member.display_name)
                     return "added"
+                # 자격이 없는, 우수회원 역할 보유자 : 역할 회수
                 elif not should_have_role and has_role:
-                    await member.remove_roles(role, reason="우수회원 조건 미충족")
-                    log.info(f"[ROLE_REMOVE] {member.display_name} → 역할 회수")
+                    await member.remove_roles(role, reason="우수회원 조건 미달")
+                    if reason:
+                        removed_reasons[reason].append(member.display_name)
                     return "removed"
                 else:
                     return "skipped"
             except discord.Forbidden:
                 log.error(f"[ROLE_ASSIGN] {member.display_name} 역할 부여 실패: 권한 부족")
                 return "skipped"
-
+    
     async def fetch_item_level(self, session, character_name):
         url = config.LOA_API_URL.format(name=character_name)
         headers = {
@@ -146,15 +172,17 @@ class RoleScheduler(commands.Cog):
                     if resp.status == 200:
                         try:
                             data = await resp.json()
-                            if data and isinstance(data, dict):
-                                raw_level = data.get("ItemAvgLevel")
-                                return float(raw_level.replace(",", "")) if raw_level else None
-                            else:
-                                log.warning(f"[API] {character_name} 응답이 비어있거나 잘못된 구조입니다.")
-                                return None
-                        except Exception as parse_err:
-                            log.error(f"[API] JSON 파싱 오류: {parse_err}")
+                        except Exception as e:
+                            log.error(f"[API] JSON 파싱 실패: {e}")
                             return None
+                        
+                        if not isinstance(data, dict):
+                            log.warning(f"[API] 응답이 JSON이 아님: {data}")
+                            return None
+                        
+                        raw_level = data.get("ItemAvgLevel")
+                        return float(raw_level.replace(",", "")) if raw_level else None
+                        
                     elif resp.status == 429:
                         retry_after = int(resp.headers.get("Retry-After", "3"))
                         log.warning(f"[API] {character_name} → 429 Rate Limit. {retry_after}초 후 재시도")
@@ -179,7 +207,6 @@ class RoleScheduler(commands.Cog):
                 await ctx.send(f"{character_name}님의 평균 아이템 레벨은 {item_level} 입니다.")
             else:
                 await ctx.send(f"{character_name}님의 아이템 레벨을 가져올 수 없습니다.")
-
 
 async def setup(bot):
     await bot.add_cog(RoleScheduler(bot))
