@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 role_sync_log_*.txt
 logs/
+Administrative_documents.txt
