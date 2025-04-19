@@ -51,6 +51,7 @@ class RoleScheduler(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.scheduler = AsyncIOScheduler()
+        self.session = aiohttp.ClientSession()
         trigger = CronTrigger(**config.SCHEDULE_CRON)
         self.scheduler.add_job(
             self.check_all_members,
@@ -86,43 +87,38 @@ class RoleScheduler(commands.Cog):
         removed_reasons = {"join": [], "item": []}
         failed_members = []
 
-        async with aiohttp.ClientSession() as session:
-            members = guild.members
-            chunks = [members[i:i+self.chunk_size] for i in range(0, len(members), self.chunk_size)]
-
-            for chunk_index, chunk in enumerate(chunks):
-                log.info(f"[ROLE_CHECK] 체크 {chunk_index+1}/{len(chunks)} 시작")
-                tasks = []
-
-                for member in chunk:
-                    tasks.append(self.evaluate_member(session, guild, role, verify_role, member, failed_members, added_reasons, removed_reasons))
-
-                results = await asyncio.gather(*tasks)
-                for result in results:
-                    if result == "added":
-                        added += 1
-                    elif result == "removed":
-                        removed += 1
-                    elif result == "skipped":
-                        skipped += 1
-
-                await asyncio.sleep(self.chunk_delay)
-
-            # 2차 재시도 처리
-            if failed_members:
-                log.info(f"[ROLE_CHECK] 아이템레벨 재시도 대상: {len(failed_members)}명")
-                retry_results = await asyncio.gather(*[
-                    self.evaluate_member(session, guild, role, verify_role, member, [], added_reasons, removed_reasons, is_retry=True)
-                    for member in failed_members
-                ])
-                for result in retry_results:
-                    if result == "added":
-                        added += 1
-                    elif result == "removed":
-                        removed += 1
-                    elif result == "skipped":
-                        skipped += 1
-
+        
+        session = self.session
+        members = guild.members
+        chunks = [members[i:i+self.chunk_size] for i in range(0, len(members), self.chunk_size)]
+        for chunk_index, chunk in enumerate(chunks):
+            log.info(f"[ROLE_CHECK] 체크 {chunk_index+1}/{len(chunks)} 시작")
+            tasks = []
+            for member in chunk:
+                tasks.append(self.evaluate_member(session, guild, role, verify_role, member, failed_members, added_reasons, removed_reasons))
+            results = await asyncio.gather(*tasks)
+            for result in results:
+                if result == "added":
+                    added += 1
+                elif result == "removed":
+                    removed += 1
+                elif result == "skipped":
+                    skipped += 1
+            await asyncio.sleep(self.chunk_delay)
+        # 2차 재시도 처리
+        if failed_members:
+            log.info(f"[ROLE_CHECK] 아이템레벨 재시도 대상: {len(failed_members)}명")
+            retry_results = await asyncio.gather(*[
+                self.evaluate_member(session, guild, role, verify_role, member, [], added_reasons, removed_reasons, is_retry=True)
+                for member in failed_members
+            ])
+            for result in retry_results:
+                if result == "added":
+                    added += 1
+                elif result == "removed":
+                    removed += 1
+                elif result == "skipped":
+                    skipped += 1
         log.info(f"[ROLE_CHECK] 완료: 부여됨 {added}, 회수됨 {removed}, 건너뜀 {skipped}")
 
         # 로그 파일에 사유 별 데이터 기록
@@ -248,6 +244,11 @@ class RoleScheduler(commands.Cog):
                 await ctx.send(f"{character_name}님의 아이템 레벨은 {item_level} 입니다.")
             else:
                 await ctx.send(f"{character_name}님의 아이템 레벨을 가져올 수 없습니다.")
+
+    def cog_unload(self):
+        # Cog 가 언로드될 때 세션도 닫아 줍니다
+        self.scheduler.shutdown()
+        asyncio.create_task(self.session.close())
 
 async def setup(bot):
     await bot.add_cog(RoleScheduler(bot))

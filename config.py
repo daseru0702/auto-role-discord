@@ -11,6 +11,8 @@ DISCORD_TOKEN  = os.getenv("DISCORD_TOKEN")
 LOA_API_KEY    = os.getenv("LOA_API_KEY")
 GUILD_ID       = int(os.getenv("GUILD_ID"))
 
+LOA_API_URL      = "https://developer-lostark.game.onstove.com/armories/characters/{name}/profiles"
+
 LOA_SIBLINGS_URL = (
     "https://developer-lostark.game.onstove.com"
     "/characters/{name}/siblings"
